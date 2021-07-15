@@ -104,7 +104,7 @@ func mustTemp(pre, body string) string {
 func ltoa(l *RaftLog) string {
 	s := fmt.Sprintf("committed: %d\n", l.committed)
 	s += fmt.Sprintf("applied:  %d\n", l.applied)
-	for i, e := range l.entries {
+	for i, e := range l.Entries() {
 		s += fmt.Sprintf("#%d: %+v\n", i, e)
 	}
 	return s

@@ -64,7 +64,7 @@ func testUpdateTermFromMessage(t *testing.T, state StateType) {
 	r.Step(pb.Message{MsgType: pb.MessageType_MsgAppend, Term: 2})
 
 	if r.Term != 2 {
-		t.Errorf( "term = %d, want %d", r.Term, 2)
+		t.Errorf("term = %d, want %d", r.Term, 2)
 	}
 	if r.State != StateFollower {
 		t.Errorf("state = %v, want %v", r.State, StateFollower)
@@ -658,7 +658,7 @@ func TestFollowerAppendEntries2AB(t *testing.T) {
 		for _, ent := range tt.wents {
 			wents = append(wents, *ent)
 		}
-		if g := r.RaftLog.entries; !reflect.DeepEqual(g, wents) {
+		if g := r.RaftLog.Entries(); !reflect.DeepEqual(g, wents) {
 			t.Errorf("#%d: ents = %+v, want %+v", i, g, wents)
 		}
 		var wunstable []pb.Entry
@@ -909,7 +909,7 @@ func commitNoopEntry(r *Raft, s *MemoryStorage) {
 	r.readMessages()
 	s.Append(r.RaftLog.unstableEntries())
 	r.RaftLog.applied = r.RaftLog.committed
-	r.RaftLog.stabled = r.RaftLog.LastIndex()
+	r.RaftLog.stableTo(r.RaftLog.LastIndex())
 }
 
 func acceptAndReply(m pb.Message) pb.Message {

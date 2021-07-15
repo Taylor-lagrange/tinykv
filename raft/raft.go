@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sort"
 	"time"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
@@ -110,6 +111,20 @@ func (c *Config) validate() error {
 // progresses of all followers, and sends entries to the follower based on its progress.
 type Progress struct {
 	Match, Next uint64
+}
+
+// maybeUpdate returns false if the given n index comes from an outdated message.
+// Otherwise it updates the progress and returns true.
+func (pr *Progress) maybeUpdate(n uint64) bool {
+	var updated bool
+	if pr.Match < n {
+		pr.Match = n
+		updated = true
+	}
+	if pr.Next < n+1 {
+		pr.Next = n + 1
+	}
+	return updated
 }
 
 type Raft struct {
@@ -292,6 +307,8 @@ func (r *Raft) becomeLeader() {
 	r.Lead = r.id
 	r.State = StateLeader
 	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{Term: r.Term, Index: r.RaftLog.LastIndex() + 1, Data: nil})
+	// update it's sync record
+	r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
 	for id := range r.Prs {
 		if id != r.id {
 			r.sendAppend(id)
@@ -359,22 +376,41 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 	// if the log match
 	if i, err := r.RaftLog.Term(m.Index); err == nil && i == m.LogTerm {
-		ci := uint64(0)
+		ci := -1
 		lastnewi := m.Index + uint64(len(m.Entries))
 		for _, ne := range m.Entries {
-			if j, err := r.RaftLog.Term(ne.GetIndex()); (err != nil || j != ne.Term) && (j != 0) {
-				ci = ne.GetIndex()
+			if j, err := r.RaftLog.Term(ne.Index); err == nil && j == ne.Term {
+				ci = int(ne.GetIndex())
 				break
 			}
 		}
+		// m.Entries before ci already in the r.RaftLog , discard it
 		var entry []pb.Entry
 		for i := range m.Entries {
-			entry = append(entry, *m.Entries[i])
+			if i > ci {
+				entry = append(entry, *m.Entries[i])
+			}
+
 		}
-		if ci == 0 {
-			r.RaftLog.entries = append(r.RaftLog.entries, entry...)
-		} else {
-			r.RaftLog.entries = append(r.RaftLog.entries, entry[ci-r.RaftLog.stabled-1:]...)
+		// start append maybe truncate
+		if len(entry) != 0 {
+			after := entry[0].Index
+			switch {
+			case after == r.RaftLog.stabled+1+uint64(len(r.RaftLog.entries)):
+				// after is the next index in the u.entries
+				// directly append
+				r.RaftLog.entries = append(r.RaftLog.entries, entry...)
+			case after <= r.RaftLog.stabled+1:
+				// The log is being truncated to before our current offset
+				// portion, so set the offset and replace the entries
+				r.RaftLog.stabled = after - 1
+				r.RaftLog.entries = entry
+			default:
+				// truncate to after and copy to u.entries
+				// then append
+				t, _ := r.RaftLog.slice(r.RaftLog.stabled+1, after)
+				r.RaftLog.entries = append(t, entry...)
+			}
 		}
 		r.RaftLog.committed = max(r.RaftLog.committed, min(lastnewi, m.Commit))
 		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: lastnewi})
@@ -475,10 +511,15 @@ func stepLeader(r *Raft, m pb.Message) {
 			return
 		}
 		var entry []pb.Entry
+		li := r.RaftLog.LastIndex()
 		for i := range m.Entries {
+			m.Entries[i].Term = r.Term
+			m.Entries[i].Index = li + 1 + uint64(i)
 			entry = append(entry, *m.Entries[i])
 		}
 		r.RaftLog.entries = append(r.RaftLog.entries, entry...)
+		r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
+		r.maybeCommit()
 		for id := range r.Prs {
 			if r.id != id {
 				r.sendAppend(id)
@@ -494,6 +535,18 @@ func stepLeader(r *Raft, m pb.Message) {
 		if m.Reject {
 			pr.Next--
 			r.sendAppend(m.From)
+		} else {
+			// update pr info
+			pr.maybeUpdate(m.Index)
+			// try to advance commit
+			//r.maybeCommit()
+			if r.maybeCommit() {
+				for i := range r.Prs {
+					if i != r.id {
+						r.sendAppend(i)
+					}
+				}
+			}
 		}
 	case pb.MessageType_MsgHeartbeatResponse:
 		if pr.Match < r.RaftLog.LastIndex() {
@@ -526,8 +579,14 @@ func stepCandidate(r *Raft, m pb.Message) {
 				granted++
 			}
 		}
-		if granted >= len(r.Prs)/2+1 {
+		switch len(r.Prs)/2 + 1 {
+		case granted:
 			r.becomeLeader()
+		case len(r.votes) - granted:
+			// The election fails because a quorum of nodes
+			// know about the election that already happened at term r.Term. Node's
+			// term is pushed ahead to r.Term.
+			r.becomeFollower(r.Term, None)
 		}
 	}
 }
@@ -565,4 +624,23 @@ func stepFollower(r *Raft, m pb.Message) {
 
 func (l *RaftLog) isUpToDate(lasti, term uint64) bool {
 	return term > l.LastTerm() || (term == l.LastTerm() && lasti >= l.LastIndex())
+}
+
+// maybeCommit attempts to advance the commit index. Returns true if
+// the commit index changed (in which case the caller should call
+// r.bcastAppend).
+func (r *Raft) maybeCommit() bool {
+	mis := make(uint64Slice, 0, len(r.Prs))
+	for _, p := range r.Prs {
+		mis = append(mis, p.Match)
+	}
+	sort.Sort(sort.Reverse(mis))
+	mci := mis[len(r.Prs)/2]
+	// only commit log in leader's term!
+	commitTerm, _ := r.RaftLog.Term(mci)
+	if mci > r.RaftLog.committed && commitTerm == r.Term {
+		r.RaftLog.committed = max(r.RaftLog.committed, mci)
+		return true
+	}
+	return false
 }

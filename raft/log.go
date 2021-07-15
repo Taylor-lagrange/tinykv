@@ -96,7 +96,7 @@ func (l *RaftLog) maybeCompact() {
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	if len(l.entries) == 0 {
-		return nil
+		return make([]pb.Entry, 0, 1)
 	}
 	return l.entries
 }
@@ -120,7 +120,23 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 
 // slice returns a slice of log entries from lo through hi-1, inclusive.
 func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
+	if (lo == uint64(1) && hi == uint64(0)) || lo >= hi {
+		return nil, nil
+	}
 	var ents []pb.Entry
+	if len(l.entries) != 0 {
+
+	} else {
+		storedEnts, err := l.storage.Entries(lo, min(hi, l.LastIndex()))
+		if err == ErrCompacted {
+			return nil, err
+		} else if err == ErrUnavailable {
+			panic("entries is unavailable from storage")
+		} else if err != nil {
+			panic(err)
+		}
+		ents = storedEnts
+	}
 	// data start in storage
 	if lo < l.stabled+1 {
 		storedEnts, err := l.storage.Entries(lo, min(hi, l.stabled+1))
@@ -172,9 +188,11 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	if i < dummyIndex || i > l.LastIndex() || i == 0 {
 		return 0, nil
 	}
-	unStableIndex := i - l.stabled - 1
-	if 0 <= unStableIndex && int(unStableIndex) < len(l.entries)-1 {
-		return l.entries[unStableIndex].Term, nil
+	if len(l.entries) != 0 {
+		unStableIndex := i - l.entries[0].Index
+		if 0 <= unStableIndex && unStableIndex <= uint64(len(l.entries)-1) {
+			return l.entries[unStableIndex].Term, nil
+		}
 	}
 	t, err := l.storage.Term(i)
 	if err == nil {
@@ -186,7 +204,25 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	panic(err)
 }
 
+func (l *RaftLog) FirstIndex() uint64 {
+	t, _ := l.storage.FirstIndex()
+	return t
+}
+
 func (l *RaftLog) LastTerm() uint64 {
 	t, _ := l.Term(l.LastIndex())
 	return t
+}
+
+func (l *RaftLog) stableTo(i uint64) {
+	if i >= l.stabled+1 {
+		l.entries = l.entries[i-l.stabled:]
+		l.stabled = i
+	}
+}
+
+func (l *RaftLog) Entries() []pb.Entry {
+	firstIndex, _ := l.storage.FirstIndex()
+	g, _ := l.slice(firstIndex, l.LastIndex()+1)
+	return g
 }
