@@ -113,6 +113,16 @@ type Progress struct {
 	Match, Next uint64
 }
 
+func (r *Raft) softState() *SoftState { return &SoftState{Lead: r.Lead, RaftState: r.State} }
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
 // maybeUpdate returns false if the given n index comes from an outdated message.
 // Otherwise it updates the progress and returns true.
 func (pr *Progress) maybeUpdate(n uint64) bool {
@@ -309,6 +319,7 @@ func (r *Raft) becomeLeader() {
 	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{Term: r.Term, Index: r.RaftLog.LastIndex() + 1, Data: nil})
 	// update it's sync record
 	r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
+	r.maybeCommit()
 	for id := range r.Prs {
 		if id != r.id {
 			r.sendAppend(id)

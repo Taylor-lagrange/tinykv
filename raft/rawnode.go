@@ -33,6 +33,10 @@ type SoftState struct {
 	RaftState StateType
 }
 
+func (a *SoftState) equal(b *SoftState) bool {
+	return a.Lead == b.Lead && a.RaftState == b.RaftState
+}
+
 // Ready encapsulates the entries and messages that are ready to read,
 // be saved to stable storage, committed or sent to other peers.
 // All fields in Ready are read-only.
@@ -70,15 +74,47 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	prevSoftSt *SoftState
+	prevHardSt pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	node := &RawNode{
+	if config.ID == 0 {
+		panic("config.ID must not be zero")
+	}
+	rn := &RawNode{
 		Raft: newRaft(config),
 	}
-	return node, nil
+	lastIndex, err := config.Storage.LastIndex()
+	if err != nil {
+		panic(err)
+	}
+	if lastIndex == 0 {
+		rn.Raft.becomeFollower(1, None)
+		//ents := make([]pb.Entry, len(config.peers))
+		//for i, peer := range config.peers {
+		//	cc := pb.ConfChange{ChangeType: pb.ConfChangeType_AddNode, NodeId: peer}
+		//	data, err := cc.Marshal()
+		//	if err != nil {
+		//		panic("unexpected marshal error")
+		//	}
+		//
+		//	ents[i] = pb.Entry{EntryType: pb.EntryType_EntryConfChange, Term: 1, Index: uint64(i + 1), Data: data}
+		//}
+		//rn.Raft.RaftLog.entries = ents
+		//rn.Raft.RaftLog.committed = uint64(len(ents))
+	}
+
+	// Set the initial hard and soft states after performing all initialization.
+	rn.prevSoftSt = rn.Raft.softState()
+	if lastIndex == 0 {
+		rn.prevHardSt = pb.HardState{}
+	} else {
+		rn.prevHardSt = rn.Raft.hardState()
+	}
+	return rn, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -146,12 +182,33 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	return Ready{}
+	rd := Ready{
+		Entries:          rn.Raft.RaftLog.unstableEntries(),
+		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
+		Messages:         rn.Raft.msgs,
+	}
+	if softSt := rn.Raft.softState(); !softSt.equal(rn.prevSoftSt) {
+		rd.SoftState = softSt
+	}
+	if hardSt := rn.Raft.hardState(); !isHardStateEqual(hardSt, rn.prevHardSt) {
+		rd.HardState = hardSt
+	}
+	rn.Raft.msgs = nil
+	return rd
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
+	if len(rn.Raft.msgs) != 0 {
+		return true
+	}
+	if softSt := rn.Raft.softState(); !softSt.equal(rn.prevSoftSt) {
+		return true
+	}
+	if hardSt := rn.Raft.hardState(); !isHardStateEqual(hardSt, rn.prevHardSt) {
+		return true
+	}
 	return false
 }
 
@@ -159,6 +216,32 @@ func (rn *RawNode) HasReady() bool {
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	if rd.SoftState != nil {
+		rn.prevSoftSt = rd.SoftState
+	}
+	if !IsEmptyHardState(rd.HardState) {
+		rn.prevHardSt = rd.HardState
+	}
+	if rn.prevHardSt.Commit != 0 {
+		// In most cases, prevHardSt and rd.HardState will be the same
+		// because when there are new entries to apply we just sent a
+		// HardState with an updated Commit value. However, on initial
+		// startup the two are different because we don't send a HardState
+		// until something changes, but we do send any un-applied but
+		// committed entries (and previously-committed entries may be
+		// incorporated into the snapshot, even if rd.CommittedEntries is
+		// empty). Therefore we mark all committed entries as applied
+		// whether they were included in rd.HardState or not.
+		rn.Raft.RaftLog.applied = rn.prevHardSt.Commit
+	}
+	if len(rd.Entries) > 0 {
+		e := rd.Entries[len(rd.Entries)-1]
+		rn.Raft.RaftLog.stableTo(e.Index)
+	}
+	//TODO: Snapshot
+	//if !IsEmptySnap(rd.Snapshot) {
+	//	rn.raft.raftLog.stableSnapTo(rd.Snapshot.Metadata.Index)
+	//}
 }
 
 // GetProgress return the the Progress of this node and its peers, if this

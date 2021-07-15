@@ -79,7 +79,12 @@ func newLog(storage Storage) *RaftLog {
 	}
 	lastIndex, err := storage.LastIndex()
 	// Initialize our committed and applied pointers to the time of the last compaction.
-	raftLog.committed = firstIndex - 1
+	h, _, _ := storage.InitialState()
+	if h.Commit != 0 {
+		raftLog.committed = h.Commit
+	} else {
+		raftLog.committed = firstIndex - 1
+	}
 	raftLog.applied = firstIndex - 1
 	raftLog.stabled = lastIndex
 	return raftLog
