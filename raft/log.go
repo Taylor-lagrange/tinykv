@@ -87,6 +87,7 @@ func newLog(storage Storage) *RaftLog {
 	}
 	raftLog.applied = firstIndex - 1
 	raftLog.stabled = lastIndex
+	raftLog.entries, _ = storage.Entries(firstIndex, lastIndex+1)
 	return raftLog
 }
 
@@ -95,6 +96,7 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	l.entries = l.unstableEntries()
 }
 
 // unstableEntries return all the unstable entries
@@ -103,7 +105,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 	if len(l.entries) == 0 {
 		return make([]pb.Entry, 0, 1)
 	}
-	return l.entries
+	return l.entries[l.stabled-l.entries[0].Index+1:]
 }
 
 // nextEnts returns all the committed but not applied entries = ( applied , committed ]
@@ -111,8 +113,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 // entries after the index of snapshot.
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	firstIndex, _ := l.storage.FirstIndex()
-	off := max(l.applied+1, firstIndex)
+	off := max(l.applied+1, l.FirstIndex())
 	if l.committed+1 > off {
 		ents, err := l.slice(off, l.committed+1)
 		if err != nil {
@@ -130,9 +131,29 @@ func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
 	}
 	var ents []pb.Entry
 	if len(l.entries) != 0 {
-
+		// data in unstable entries, first detect data in entries(some data in storage maybe corrupt)
+		if hi > l.entries[0].Index {
+			ents = l.entries[max(lo, l.entries[0].Index)-l.entries[0].Index : hi-l.entries[0].Index]
+		}
+		// if don't get full data,get in storage
+		var storedEnts []pb.Entry
+		var err error
+		switch {
+		case len(ents) == 0:
+			storedEnts, err = l.storage.Entries(lo, min(hi, l.LastIndex()+1))
+		case ents[0].Index > lo:
+			storedEnts, err = l.storage.Entries(lo, ents[0].Index)
+		}
+		if err == ErrCompacted {
+			return nil, err
+		} else if err == ErrUnavailable {
+			panic("entries is unavailable from storage")
+		} else if err != nil {
+			panic(err)
+		}
+		ents = append(storedEnts, ents...)
 	} else {
-		storedEnts, err := l.storage.Entries(lo, min(hi, l.LastIndex()))
+		storedEnts, err := l.storage.Entries(lo, min(hi, l.LastIndex()+1))
 		if err == ErrCompacted {
 			return nil, err
 		} else if err == ErrUnavailable {
@@ -141,31 +162,6 @@ func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
 			panic(err)
 		}
 		ents = storedEnts
-	}
-	// data start in storage
-	if lo < l.stabled+1 {
-		storedEnts, err := l.storage.Entries(lo, min(hi, l.stabled+1))
-		if err == ErrCompacted {
-			return nil, err
-		} else if err == ErrUnavailable {
-			panic("entries is unavailable from storage")
-		} else if err != nil {
-			panic(err)
-		}
-		// check if ents has reached the demand
-		if uint64(len(storedEnts)) < min(hi, l.stabled+1)-lo {
-			return storedEnts, nil
-		}
-		ents = storedEnts
-	}
-	// some data in unstable entries
-	if hi > l.stabled+1 {
-		unstable := l.entries[max(lo, l.stabled+1)-l.stabled-1 : hi-l.stabled-1]
-		if len(ents) > 0 {
-			ents = append(ents, unstable...)
-		} else {
-			ents = unstable
-		}
 	}
 	return ents, nil
 }
@@ -174,22 +170,26 @@ func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
 // FirstIndex use l.storage.FirstIndex()
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
+	var index uint64
+	if !IsEmptySnap(l.pendingSnapshot) {
+		index = l.pendingSnapshot.Metadata.Index
+	}
+	// data in storage can't be trust
 	if ls := len(l.entries); ls != 0 {
-		return l.entries[ls-1].Index
+		return max(index, l.entries[ls-1].Index)
 	}
 	i, err := l.storage.LastIndex()
 	if err != nil {
 		panic(err)
 	}
-	return i
+	return max(i, index)
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	// the valid term range is [index of dummy entry, last index]
-	firstIndex, _ := l.storage.FirstIndex()
-	dummyIndex := firstIndex - 1
+	dummyIndex := l.FirstIndex() - 1
 	if i < dummyIndex || i > l.LastIndex() || i == 0 {
 		return 0, nil
 	}
@@ -204,6 +204,13 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		return t, nil
 	}
 	if err == ErrCompacted || err == ErrUnavailable {
+		if !IsEmptySnap(l.pendingSnapshot) {
+			if i == l.pendingSnapshot.Metadata.Index {
+				return l.pendingSnapshot.Metadata.Term, nil
+			} else if i < l.pendingSnapshot.Metadata.Index {
+				err = ErrCompacted
+			}
+		}
 		return 0, err
 	}
 	panic(err)
@@ -211,6 +218,11 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 
 func (l *RaftLog) FirstIndex() uint64 {
 	t, _ := l.storage.FirstIndex()
+	if len(l.entries) != 0 {
+		if l.entries[0].Index < t {
+			return l.entries[0].Index
+		}
+	}
 	return t
 }
 
@@ -221,13 +233,13 @@ func (l *RaftLog) LastTerm() uint64 {
 
 func (l *RaftLog) stableTo(i uint64) {
 	if i >= l.stabled+1 {
-		l.entries = l.entries[i-l.stabled:]
+		//l.entries = l.entries[i-l.stabled:]
 		l.stabled = i
 	}
 }
 
 func (l *RaftLog) Entries() []pb.Entry {
-	firstIndex, _ := l.storage.FirstIndex()
-	g, _ := l.slice(firstIndex, l.LastIndex()+1)
-	return g
+	//firstIndex, _ := l.storage.FirstIndex()
+	//g, _ := l.slice(firstIndex, l.LastIndex()+1)
+	return l.entries
 }
