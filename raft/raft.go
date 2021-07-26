@@ -220,6 +220,12 @@ func newRaft(c *Config) *Raft {
 	for _, p := range c.peers {
 		r.Prs[p] = &Progress{Next: r.RaftLog.LastIndex() + 1}
 	}
+	// if apply not be set to the record in DB
+	// peerMsgHandler will use RaftLog.nextEnts() to get log from ( applied , committed ] to apply log
+	// the original value of apply is fistindex-1 which will lead a log be apply twice,and lead serious mistake!!!
+	if c.Applied > 0 {
+		r.RaftLog.applied = c.Applied
+	}
 	r.becomeFollower(r.Term, None)
 	return r
 }
@@ -585,6 +591,14 @@ func stepLeader(r *Raft, m pb.Message) {
 			// was removed from the configuration while serving as leader),
 			// drop any new proposals.
 			return
+		}
+		for _, entry := range m.Entries {
+			if entry.EntryType == pb.EntryType_EntryConfChange {
+				if r.PendingConfIndex != None {
+					continue
+				}
+				r.PendingConfIndex = entry.Index
+			}
 		}
 		var entry []pb.Entry
 		li := r.RaftLog.LastIndex()

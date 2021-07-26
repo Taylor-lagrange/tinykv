@@ -2,10 +2,12 @@ package raftstore
 
 import (
 	"fmt"
+	"reflect"
+	"time"
+
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
-	"time"
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
@@ -55,11 +57,80 @@ func (d *peerMsgHandler) handleProposal(entry *eraftpb.Entry, handle func(*propo
 	}
 }
 
+func searchRegionPeer(region *metapb.Region, id uint64) int {
+	for i, peer := range region.Peers {
+		if peer.Id == id {
+			return i
+		}
+	}
+	return len(region.Peers)
+}
+
 func (d *peerMsgHandler) ApplyCommit(entries []eraftpb.Entry) *engine_util.WriteBatch {
 	wb := &engine_util.WriteBatch{}
 	for _, entry := range entries {
 		msg := &raft_cmdpb.RaftCmdRequest{}
 		msg.Unmarshal(entry.Data)
+		if entry.EntryType == eraftpb.EntryType_EntryConfChange {
+			cc := &eraftpb.ConfChange{}
+			err := cc.Unmarshal(entry.Data)
+			msg.Unmarshal(cc.Context)
+			region := d.Region()
+			err = util.CheckRegionEpoch(msg, region, true)
+			if errEpochNotMatching, ok := err.(*util.ErrEpochNotMatch); ok {
+				d.handleProposal(&entry, func(p *proposal) {
+					p.cb.Done(ErrResp(errEpochNotMatching))
+				})
+				continue
+			}
+			switch cc.ChangeType {
+			case eraftpb.ConfChangeType_AddNode:
+				n := searchRegionPeer(region, cc.NodeId)
+				if n == len(region.Peers) {
+					peer := msg.AdminRequest.ChangePeer.Peer
+					region.Peers = append(region.Peers, peer)
+					region.RegionEpoch.ConfVer++
+					meta.WriteRegionState(wb, region, rspb.PeerState_Normal)
+					storeMeta := d.ctx.storeMeta
+					storeMeta.Lock()
+					storeMeta.regions[region.Id] = region
+					storeMeta.Unlock()
+					d.insertPeerCache(peer)
+				}
+			case eraftpb.ConfChangeType_RemoveNode:
+				if cc.NodeId == d.Meta.Id {
+					if !d.stopped {
+						d.destroyPeer()
+					}
+					continue
+				}
+				n := searchRegionPeer(region, cc.NodeId)
+				if n < len(region.Peers) {
+					region.Peers = append(region.Peers[:n], region.Peers[n+1:]...)
+					region.RegionEpoch.ConfVer++
+					meta.WriteRegionState(wb, region, rspb.PeerState_Normal)
+					storeMeta := d.ctx.storeMeta
+					storeMeta.Lock()
+					storeMeta.regions[region.Id] = region
+					storeMeta.Unlock()
+					d.removePeerCache(cc.NodeId)
+				}
+			}
+			d.RaftGroup.ApplyConfChange(*cc)
+			d.handleProposal(&entry, func(p *proposal) {
+				p.cb.Done(&raft_cmdpb.RaftCmdResponse{
+					Header: &raft_cmdpb.RaftResponseHeader{},
+					AdminResponse: &raft_cmdpb.AdminResponse{
+						CmdType:    raft_cmdpb.AdminCmdType_ChangePeer,
+						ChangePeer: &raft_cmdpb.ChangePeerResponse{},
+					},
+				})
+			})
+			if d.IsLeader() {
+				d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+			}
+			continue
+		}
 		if msg.AdminRequest != nil {
 			req := msg.AdminRequest
 			switch req.CmdType {
@@ -70,6 +141,68 @@ func (d *peerMsgHandler) ApplyCommit(entries []eraftpb.Entry) *engine_util.Write
 					d.peerStorage.applyState.TruncatedState.Term = compactLog.CompactTerm
 					//wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 					d.ScheduleCompactLog(d.peerStorage.applyState.TruncatedState.Index)
+				}
+			case raft_cmdpb.AdminCmdType_Split:
+				region := d.Region()
+				err := util.CheckRegionEpoch(msg, region, true)
+				if errEpochNotMatching, ok := err.(*util.ErrEpochNotMatch); ok {
+					d.handleProposal(&entry, func(p *proposal) {
+						p.cb.Done(ErrResp(errEpochNotMatching))
+					})
+					continue
+				}
+				split := req.GetSplit()
+				err = util.CheckKeyInRegion(split.SplitKey, region)
+				if err != nil {
+					d.handleProposal(&entry, func(p *proposal) {
+						p.cb.Done(ErrResp(err))
+					})
+					continue
+				}
+				storeMeta := d.ctx.storeMeta
+				storeMeta.Lock()
+				storeMeta.regionRanges.Delete(&regionItem{region: region})
+				region.RegionEpoch.Version++
+				peers := make([]*metapb.Peer, 0)
+				for i, peer := range region.Peers {
+					peers = append(peers, &metapb.Peer{Id: split.NewPeerIds[i], StoreId: peer.StoreId})
+				}
+				newRegion := &metapb.Region{
+					Id:       split.NewRegionId,
+					StartKey: split.SplitKey,
+					EndKey:   region.EndKey,
+					Peers:    peers,
+					RegionEpoch: &metapb.RegionEpoch{
+						ConfVer: 1,
+						Version: 1,
+					},
+				}
+				storeMeta.regions[newRegion.Id] = newRegion
+				region.EndKey = split.SplitKey
+				storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: region})
+				storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+				storeMeta.Unlock()
+				meta.WriteRegionState(wb, region, rspb.PeerState_Normal)
+				meta.WriteRegionState(wb, newRegion, rspb.PeerState_Normal)
+				d.SizeDiffHint = 0
+				d.ApproximateSize = new(uint64)
+				peer, err := createPeer(d.ctx.store.Id, d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
+				if err != nil {
+					panic(err)
+				}
+				d.ctx.router.register(peer)
+				d.ctx.router.send(newRegion.Id, message.Msg{Type: message.MsgTypeStart})
+				d.handleProposal(&entry, func(p *proposal) {
+					p.cb.Done(&raft_cmdpb.RaftCmdResponse{
+						Header: &raft_cmdpb.RaftResponseHeader{},
+						AdminResponse: &raft_cmdpb.AdminResponse{
+							CmdType: raft_cmdpb.AdminCmdType_Split,
+							Split:   &raft_cmdpb.SplitResponse{Regions: []*metapb.Region{region, newRegion}},
+						},
+					})
+				})
+				if d.IsLeader() {
+					d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
 				}
 			}
 		}
@@ -131,13 +264,28 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	// Your Code Here (2B).
 	if d.RaftGroup.HasReady() {
 		rd := d.RaftGroup.Ready()
+		result, _ := d.peerStorage.SaveReadyState(&rd)
+		if result != nil {
+			if !reflect.DeepEqual(result.PrevRegion, result.Region) {
+				d.peerStorage.SetRegion(result.Region)
+				storeMeta := d.ctx.storeMeta
+				storeMeta.Lock()
+				storeMeta.regions[result.Region.Id] = result.Region
+				storeMeta.regionRanges.Delete(&regionItem{region: result.PrevRegion})
+				storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: result.Region})
+				storeMeta.Unlock()
+			}
+		}
 		d.Send(d.ctx.trans, rd.Messages)
-		d.peerStorage.SaveReadyState(&rd)
 		if len(rd.CommittedEntries) > 0 {
 			kvWB := d.ApplyCommit(rd.CommittedEntries)
 			d.peerStorage.applyState.AppliedIndex = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
-			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-			kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+			// if a node destroy entry be commit, ApplyCommit will destroy all metadata it store
+			// under this situation , we can't write to kv
+			if !d.stopped {
+				kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+				kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+			}
 		}
 		d.RaftGroup.Advance(rd)
 	}
